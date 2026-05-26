@@ -15,6 +15,7 @@
  */
 
 import * as http from 'http';
+import * as fs from 'node:fs';
 import { randomUUID } from 'crypto';
 import type Database from '@ansvar/mcp-sqlite';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -36,6 +37,12 @@ const HOST = process.env.HOST ?? '0.0.0.0';
 // ---------------------------------------------------------------------------
 
 let dbInstance: InstanceType<typeof Database> | null = null;
+let runtimeDbPath: string | null = null;
+
+function removeRuntimeDbLockDir(dbPath: string | null): void {
+  if (!dbPath) return;
+  fs.rmSync(`${dbPath}.lock`, { recursive: true, force: true });
+}
 
 function getDb(): InstanceType<typeof Database> {
   if (!dbInstance) {
@@ -271,7 +278,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 async function main(): Promise<void> {
   // Ensure database exists (downloads if needed)
   const sourceDbPath = await ensureDatabase();
-  const runtimeDbPath = prepareRuntimeDatabase(sourceDbPath);
+  runtimeDbPath = prepareRuntimeDatabase(sourceDbPath);
   dbInstance = openDb(runtimeDbPath);
   console.error(`[${SERVER_NAME}] Database loaded from ${runtimeDbPath} (source: ${sourceDbPath})`);
 
@@ -307,6 +314,7 @@ async function main(): Promise<void> {
       dbInstance.close();
       dbInstance = null;
     }
+    removeRuntimeDbLockDir(runtimeDbPath);
 
     httpServer.close(() => process.exit(0));
     // Force exit after 5 seconds
@@ -319,5 +327,10 @@ async function main(): Promise<void> {
 
 main().catch((error: unknown) => {
   console.error(`[${SERVER_NAME}] Fatal error:`, error);
+  if (dbInstance) {
+    dbInstance.close();
+    dbInstance = null;
+  }
+  removeRuntimeDbLockDir(runtimeDbPath);
   process.exit(1);
 });

@@ -87,7 +87,20 @@ function runFtsSearch(
     JOIN legal_provisions AS p ON provisions_fts.rowid = p.id
     JOIN legal_documents AS d ON p.document_id = d.id
     ${whereClause}
-    ORDER BY bm25(provisions_fts)
+    ORDER BY (bm25(provisions_fts) * CASE
+      WHEN d.title LIKE '%Burgerlijk Wetboek%'                           THEN 5.0
+      WHEN d.title LIKE '%Wetboek van Strafrecht%'                       THEN 5.0
+      WHEN d.title LIKE '%Wetboek van Burgerlijke Rechtsvordering%'      THEN 5.0
+      WHEN d.title LIKE '%Wetboek van Strafvordering%'                   THEN 5.0
+      WHEN d.title LIKE '%Algemene wet bestuursrecht%'                   THEN 4.0
+      WHEN d.title LIKE '%Arbeidsomstandighedenwet%'                     THEN 3.0
+      WHEN d.title LIKE '%Wet op het financieel toezicht%'               THEN 3.0
+      WHEN d.title LIKE 'Invoeringswet%'                                 THEN 0.3
+      WHEN d.title LIKE 'Aanpassingswet%'                                THEN 0.3
+      WHEN d.title LIKE 'Verzamelwet%'                                   THEN 0.3
+      WHEN d.title LIKE 'Wijzigingswet%'                                 THEN 0.3
+      ELSE 1.0
+    END)
     LIMIT ?
   `;
   params.push(limit);
@@ -147,7 +160,20 @@ function runVersionedFtsSearch(
     JOIN legal_provision_versions AS pv ON provision_versions_fts.rowid = pv.id
     JOIN legal_documents AS d ON pv.document_id = d.id
     ${whereClause}
-    ORDER BY bm25(provision_versions_fts)
+    ORDER BY (bm25(provision_versions_fts) * CASE
+      WHEN d.title LIKE '%Burgerlijk Wetboek%'                           THEN 5.0
+      WHEN d.title LIKE '%Wetboek van Strafrecht%'                       THEN 5.0
+      WHEN d.title LIKE '%Wetboek van Burgerlijke Rechtsvordering%'      THEN 5.0
+      WHEN d.title LIKE '%Wetboek van Strafvordering%'                   THEN 5.0
+      WHEN d.title LIKE '%Algemene wet bestuursrecht%'                   THEN 4.0
+      WHEN d.title LIKE '%Arbeidsomstandighedenwet%'                     THEN 3.0
+      WHEN d.title LIKE '%Wet op het financieel toezicht%'               THEN 3.0
+      WHEN d.title LIKE 'Invoeringswet%'                                 THEN 0.3
+      WHEN d.title LIKE 'Aanpassingswet%'                                THEN 0.3
+      WHEN d.title LIKE 'Verzamelwet%'                                   THEN 0.3
+      WHEN d.title LIKE 'Wijzigingswet%'                                 THEN 0.3
+      ELSE 1.0
+    END)
     LIMIT ?
   `;
   params.push(limit);

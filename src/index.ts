@@ -7,11 +7,13 @@ import {
   ReadResourceRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import Database from '@ansvar/mcp-sqlite';
+import * as fs from 'node:fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 
 import { registerTools } from './tools/registry.js';
 import { ensureDatabase } from './utils/ensure-database.js';
+import { prepareRuntimeDatabase } from './utils/runtime-db.js';
 import {
   detectCapabilities,
   readDbMetadata,
@@ -38,6 +40,12 @@ function getDefaultDbPath(): string {
 let dbInstance: InstanceType<typeof Database> | null = null;
 let dbCapabilities: Set<Capability> | null = null;
 let dbMetadata: DbMetadata | null = null;
+let runtimeDbPath: string | null = null;
+
+function removeRuntimeDbLockDir(dbPath: string | null): void {
+  if (!dbPath) return;
+  fs.rmSync(`${dbPath}.lock`, { recursive: true, force: true });
+}
 
 export function openDb(dbPath: string): InstanceType<typeof Database> {
   return new Database(dbPath, { readonly: true });
@@ -73,6 +81,7 @@ function closeDb(): void {
     dbInstance.close();
     dbInstance = null;
   }
+  removeRuntimeDbLockDir(runtimeDbPath);
 }
 
 // ---------------------------------------------------------------------------
@@ -160,14 +169,17 @@ export function createServer(getDbFn: () => InstanceType<typeof Database>): Serv
 
 async function main(): Promise<void> {
   // Ensure database exists (downloads from GitHub Releases if needed)
-  const dbPath = await ensureDatabase();
+  const sourceDbPath = await ensureDatabase();
+  runtimeDbPath = prepareRuntimeDatabase(sourceDbPath);
   // Make the resolved path available to getDb() and child processes
-  process.env[DB_ENV_VAR] = dbPath;
+  process.env[DB_ENV_VAR] = runtimeDbPath;
 
   const server = createServer(getDb);
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`[${SERVER_NAME}] Server started on stdio`);
+  console.error(
+    `[${SERVER_NAME}] Server started on stdio (runtime DB: ${runtimeDbPath}, source: ${sourceDbPath})`,
+  );
 }
 
 process.on('SIGINT', () => {
