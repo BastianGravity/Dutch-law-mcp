@@ -146,12 +146,17 @@ export function buildApiQuery(rawQuery: string): string {
 
   const { quoted, remainder } = extractLegalPhrases(rawQuery);
 
+  // Sort by descending word length — longer words tend to be more specific (e.g.
+  // "diefstal" beats "voet"). When a phrase was extracted, 2 extra slots remain;
+  // without a phrase, allow up to 4 to avoid dropping key discriminating terms.
   const extraTokens = remainder
     .split(/\s+/)
     .map((w) => w.replace(/[^\p{L}]/gu, ''))
-    .filter((w) => w.length > 2 && !FILLER_WORDS.has(w.toLowerCase()));
+    .filter((w) => w.length > 2 && !FILLER_WORDS.has(w.toLowerCase()))
+    .sort((a, b) => b.length - a.length);
 
-  const slotsLeft = Math.max(0, 3 - quoted.length);
+  const maxSlots = quoted.length > 0 ? 3 : 4;
+  const slotsLeft = Math.max(0, maxSlots - quoted.length);
   const parts = [...quoted, ...extraTokens.slice(0, slotsLeft)];
 
   // Always return something — fall back to first 3 original words if cleaning
@@ -254,7 +259,7 @@ function addResultCitations(rows: SearchCaseLawResult[]): SearchCaseLawResult[] 
 }
 
 // ---------------------------------------------------------------------------
-// Authority + recency sort
+// Local relevance scoring + sort
 // ---------------------------------------------------------------------------
 
 function ecliYear(ecli: string): number {
@@ -263,17 +268,50 @@ function ecliYear(ecli: string): number {
   return isNaN(year) ? 0 : year;
 }
 
-function sortByAuthority(results: SearchCaseLawResult[]): SearchCaseLawResult[] {
+// Markers that indicate a purely criminal-law case — penalised when query is civil/labour.
+const CRIMINAL_MARKERS =
+  /gevangenisstraf|tenlastelegging|openbaar ministerie|opiumwet|verdachte\b|politierechter|vrijspraak|vrijgesproken|wederrechtelijke vrijheidsberoving|bedreiging met geweld|schuldigverklaring/i;
+
+// Markers that indicate administrative law — penalised for civil/labour queries.
+const ADMIN_MARKERS =
+  /hoorzitting bezwaar|bezwaarschrift|bestuursorgaan|awb\b|algemene wet bestuursrecht|beroepschrift|bestuursrechter|bezwaarprocedure/i;
+
+// Markers that indicate employment law content — rewarded.
+const EMPLOYMENT_MARKERS =
+  /ontslag|werknemer|werkgever|arbeidsovereenkomst|dienstverband|loon|cao\b/i;
+
+function extractScoringTerms(query: string): string[] {
+  return query
+    .toLowerCase()
+    .split(/\s+/)
+    .map((w) => w.replace(/[^\p{L}]/gu, ''))
+    .filter((w) => w.length > 3 && !FILLER_WORDS.has(w));
+}
+
+function scoreRelevance(result: SearchCaseLawResult, terms: string[]): number {
+  const haystack = `${result.document_title} ${result.summary ?? ''}`.toLowerCase();
+  let score = terms.reduce((s, term) => s + (haystack.includes(term) ? 1 : 0), 0);
+  if (CRIMINAL_MARKERS.test(haystack)) score -= 3;
+  if (ADMIN_MARKERS.test(haystack)) score -= 2;
+  if (EMPLOYMENT_MARKERS.test(haystack)) score += 1;
+  // Prefer recent cases (year 2015+ gets a small boost)
+  const yr = ecliYear(result.ecli);
+  if (yr >= 2020) score += 2;
+  else if (yr >= 2015) score += 1;
+  return score;
+}
+
+function sortByRelevance(results: SearchCaseLawResult[], terms: string[]): SearchCaseLawResult[] {
   return [...results].sort((a, b) => {
-    // Primary: most recent first
-    const yearDiff = ecliYear(b.ecli) - ecliYear(a.ecli);
-    if (yearDiff !== 0) return yearDiff;
-    // Tiebreaker within same year: higher-authority court first
+    const scoreDiff = scoreRelevance(b, terms) - scoreRelevance(a, terms);
+    if (scoreDiff !== 0) return scoreDiff;
+    // Within same score: higher authority first
     const aHigh = HIGH_AUTHORITY_COURTS.some((c) => a.court.toLowerCase().includes(c));
     const bHigh = HIGH_AUTHORITY_COURTS.some((c) => b.court.toLowerCase().includes(c));
     if (aHigh && !bHigh) return -1;
     if (!aHigh && bHigh) return 1;
-    return 0;
+    // Within same authority: most recent first
+    return ecliYear(b.ecli) - ecliYear(a.ecli);
   });
 }
 
@@ -313,7 +351,7 @@ async function fetchCaseContent(ecli: string): Promise<string | null> {
         .replace(/<[^>]+>/g, ' ')
         .replace(/\s+/g, ' ')
         .trim()
-        .slice(0, 600);
+        .slice(0, 1500);
     }
     return null;
   } catch {
@@ -321,8 +359,18 @@ async function fetchCaseContent(ecli: string): Promise<string | null> {
   }
 }
 
-async function fetchFromRechtspraak(query: string): Promise<SearchCaseLawResult[]> {
-  const searchUrl = `${RECHTSPRAAK_SEARCH_URL}?return=DOC&q=${encodeURIComponent(query)}&max=25&sort=DESC`;
+async function fetchFromRechtspraak(
+  query: string,
+  dateFrom?: string,
+  _dateTo?: string,
+): Promise<SearchCaseLawResult[]> {
+  // modified= filters by indexing date, excluding old AA-series cases (pre-2010) that
+  // have no inhoudsindicatie XML and score 0. Callers can override with explicit dateFrom.
+  const effectiveDateFrom = dateFrom ?? '2015-01-01';
+  // No sort parameter → API defaults to relevance ranking, avoiding recency bias.
+  // type=uitspraak filters out PHR conclusions, which are not court decisions.
+  let searchUrl = `${RECHTSPRAAK_SEARCH_URL}?return=DOC&q=${encodeURIComponent(query)}&max=25&type=uitspraak`;
+  searchUrl += `&modified=${effectiveDateFrom}`;
   const response = await axios.get<string>(searchUrl, { timeout: 8000, responseType: 'text' });
 
   const xmlParser = new Parser({ explicitArray: false });
@@ -347,13 +395,25 @@ async function fetchFromRechtspraak(query: string): Promise<SearchCaseLawResult[
     const court = ecli ? extractCourtFromEcli(ecli) : '';
     const resolvedUrl = linkHref || ecliToUrl(ecli);
 
+    // <updated> is the Atom indexing date, not the decision date.
+    // For old digitized cases (e.g. 1998 case indexed in 2013) this would mislead.
+    // Trust <updated> only when its year matches the ECLI year; otherwise derive from ECLI.
+    const ecliYr = ecli ? ecliYear(ecli) : 0;
+    const updatedYear = updatedRaw ? parseInt(updatedRaw.slice(0, 4), 10) : 0;
+    const decisionDate =
+      updatedRaw && Math.abs(updatedYear - ecliYr) <= 1
+        ? updatedRaw.slice(0, 10)
+        : ecliYr > 0
+          ? `${ecliYr}-01-01`
+          : null;
+
     return {
       document_id: ecli || idRaw || titleRaw,
       document_title: titleRaw,
       ecli: ecli || idRaw,
       court,
       case_number: null,
-      decision_date: updatedRaw ? updatedRaw.slice(0, 10) : null,
+      decision_date: decisionDate,
       procedure_type: null,
       legal_domain: null,
       summary: summaryRaw || null,
@@ -362,6 +422,26 @@ async function fetchFromRechtspraak(query: string): Promise<SearchCaseLawResult[
       url: resolvedUrl,
     };
   });
+}
+
+// Maps common legal_domain values to a keyword appended to the API query.
+// This scopes results to the right area of law when the field is provided.
+const DOMAIN_KEYWORDS: Record<string, string> = {
+  arbeidsrecht: 'arbeidsrecht',
+  civielrecht: 'civielrecht',
+  'civiel recht': 'civielrecht',
+  bestuursrecht: 'bestuursrecht',
+  strafrecht: 'strafrecht',
+  ondernemingsrecht: 'ondernemingsrecht',
+  huurrecht: 'huurrecht',
+  familierecht: 'familierecht',
+  verbintenissenrecht: 'verbintenissenrecht',
+};
+
+function domainKeyword(legal_domain: string | undefined): string | null {
+  if (!legal_domain) return null;
+  const key = legal_domain.toLowerCase().trim();
+  return DOMAIN_KEYWORDS[key] ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -379,39 +459,62 @@ export async function searchCaseLaw(
     return { results: [], _metadata: generateResponseMetadata(db) };
   }
 
-  const apiQuery = buildApiQuery(rawQuery);
+  let apiQuery = buildApiQuery(rawQuery);
+
+  // Append legal domain keyword so the API scopes to the right area of law.
+  const dk = domainKeyword(input.legal_domain);
+  if (dk) apiQuery = `${apiQuery} ${dk}`;
 
   try {
-    let raw = await fetchFromRechtspraak(apiQuery);
+    let raw = await fetchFromRechtspraak(apiQuery, input.date_from, input.date_to);
 
     if (raw.length === 0) {
       const fallback = buildFallbackQuery(rawQuery);
       if (fallback && fallback !== apiQuery) {
-        raw = await fetchFromRechtspraak(fallback);
+        raw = await fetchFromRechtspraak(fallback, input.date_from, input.date_to);
       }
     }
 
-    const sorted = sortByAuthority(raw);
-    const capped = sorted.slice(0, RESULT_CAP);
-
-    // Enrich with full case content (parallel, fail-safe — empty summary means API returned "-")
+    // Enrich ALL candidates with the official inhoudsindicatie before scoring.
+    // Always prefer fetched content over the Atom feed summary (which is often '-' or a short stub).
+    // All fetches run in parallel — wall time is bounded by the 5 s timeout, not by count.
     const enriched = await Promise.all(
-      capped.map(async (result) => {
-        if (!result.summary || result.summary === '-') {
-          const content = await fetchCaseContent(result.ecli);
-          if (content) {
-            return {
-              ...result,
-              summary: content,
-              snippet: content.slice(0, 200) + (content.length > 200 ? '…' : ''),
-            };
-          }
+      raw.map(async (result: SearchCaseLawResult) => {
+        const content = await fetchCaseContent(result.ecli);
+        if (content) {
+          return {
+            ...result,
+            summary: content,
+            snippet: content.slice(0, 200) + (content.length > 200 ? '…' : ''),
+          };
         }
         return result;
       }),
     );
 
-    const results = addResultCitations(enriched);
+    // Score every enriched candidate and emit a log line for each so scores are visible.
+    const scoringTerms = extractScoringTerms(rawQuery);
+    enriched.forEach((result) => {
+      const score = scoreRelevance(result, scoringTerms);
+      const hasContent = !!(result.summary && result.summary !== '-' && result.summary.length > 20);
+      const matched = scoringTerms.filter((t) =>
+        `${result.document_title} ${result.summary ?? ''}`.toLowerCase().includes(t),
+      );
+      console.error(
+        `[score] ${result.ecli} → ${score} | content=${hasContent ? 'YES' : 'NO'} | terms=[${matched.join(', ')}]`,
+      );
+    });
+
+    // Sort by score; prefer results with at least one term match.
+    // Fallback uses top half of scored set — avoids pulling in clearly irrelevant cases.
+    const sorted = sortByRelevance(enriched, scoringTerms);
+    const qualified = sorted.filter((r) => scoreRelevance(r, scoringTerms) >= 1);
+    const pool = qualified.length > 0 ? qualified : sorted.slice(0, Math.ceil(sorted.length / 2));
+    const capped = pool.slice(0, RESULT_CAP);
+
+    console.error(`[score] Selected top ${capped.length}: ${capped.map((r) => r.ecli).join(', ')}`);
+
+    const results = addResultCitations(capped);
 
     return {
       results,
