@@ -713,10 +713,14 @@ export async function searchCaseLaw(
             snippet: content.slice(0, 200) + (content.length > 200 ? '…' : ''),
           };
         }
+        // Fallback: behoud uitspraak met bestaande summary uit Atom-feed
+        if (result.summary && result.summary.length >= 30) {
+          return result;
+        }
         return null;
       }),
     );
-    const withContent = enriched.filter((r) => r !== null) as SearchCaseLawResult[];
+    const withContent = enriched.filter((r) => r !== null);
     console.error(`[pipeline] with inhoudsindicatie: ${withContent.length}/${raw.length}`);
 
     // Stage 3.5 — keyword pre-filter: score + keep top 12, drop criminal mismatches.

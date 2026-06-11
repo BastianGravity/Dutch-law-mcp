@@ -30,6 +30,11 @@ export interface GetProvisionResult {
   valid_to?: string | null;
 }
 
+function buildWettenUrl(documentId: string, article: string | null | undefined): string {
+  const base = `https://wetten.overheid.nl/jci1.3:c:${documentId}`;
+  return article ? `${base}&artikel=${article}` : base;
+}
+
 function buildProvisionRef(input: GetProvisionInput): string | undefined {
   if (input.provision_ref) return input.provision_ref;
   if (input.book && input.article) return `${input.book}:${input.article}`;
@@ -138,9 +143,14 @@ export async function getProvision(
   const asOfDate = normalizeAsOfDate(input.as_of_date);
   const provisionRef = buildProvisionRef(input);
 
-  const results = asOfDate
+  const rawResults = asOfDate
     ? getVersionedProvisions(db, document_id, provisionRef, asOfDate)
     : getCurrentProvisions(db, document_id, provisionRef);
+
+  const results = rawResults.map((r) => ({
+    ...r,
+    source_url: buildWettenUrl(r.document_id, r.article),
+  }));
 
   const firstResult = results.length > 0 ? results[0] : null;
   return {

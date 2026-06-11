@@ -201,20 +201,27 @@ function deduplicateResults(
   return deduped;
 }
 
+function buildWettenUrl(documentId: string, article: string | null | undefined): string {
+  const base = `https://wetten.overheid.nl/jci1.3:c:${documentId}`;
+  return article ? `${base}&artikel=${article}` : base;
+}
+
 function addResultCitations(rows: SearchLegislationResult[]): SearchLegislationResult[] {
   return rows.map((row) => {
+    const articleUrl = buildWettenUrl(row.document_id, row.article);
     const citation = buildProvisionCitation(
       row.document_id,
       row.document_title || '',
       row.provision_ref || row.article || '',
       row.document_id,
       row.provision_ref || row.article || '',
-      row.source_url,
+      articleUrl,
       null,
     );
 
     return {
       ...row,
+      source_url: articleUrl,
       _citation: withCitationAttribution(citation, {
         jurisdiction: 'NL',
         source: row.document_id,
