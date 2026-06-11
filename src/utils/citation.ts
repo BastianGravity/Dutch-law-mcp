@@ -161,35 +161,3 @@ export function buildProvisionCitation(
     },
   };
 }
-
-/**
- * Build citation for a sector regulator decision/regulation.
- *
- * @param reference      Decision/regulation reference (e.g., "FFFS 2024:1")
- * @param title          Full title
- * @param toolName       Tool name (e.g., "se_dp_get_decision")
- * @param toolArgs       Tool arguments
- * @param authority      Issuing authority (e.g., "IMY", "FI")
- * @param sourceUrl      Official URL (optional)
- */
-export function buildRegulationCitation(
-  reference: string,
-  title: string,
-  toolName: string,
-  toolArgs: Record<string, string>,
-  authority?: string | null,
-  sourceUrl?: string | null,
-): CitationMetadata {
-  const canonicalRef = reference;
-  const displayText = title || reference;
-  const aliases: string[] = [];
-  if (authority) aliases.push(`${authority}: ${reference}`);
-
-  return {
-    canonical_ref: canonicalRef,
-    display_text: displayText,
-    ...(aliases.length > 0 && { aliases }),
-    ...(sourceUrl && { source_url: sourceUrl }),
-    lookup: { tool: toolName, args: toolArgs },
-  };
-}

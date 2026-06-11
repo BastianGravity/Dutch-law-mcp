@@ -122,11 +122,7 @@ export async function buildLegalStance(
     );
   }
 
-  // 6. Collect provision refs from found provisions and case law
-  const provisionDocRefs = provisionResults.results.map((p) => ({
-    doc: p.document_id,
-    ref: p.provision_ref,
-  }));
+  // 6. Collect doc IDs from found provisions and case law
   const caseLawDocIds = caseLawResults.map((c) => c.document_id);
   const allDocIds = [...new Set([...statuteIds, ...caseLawDocIds])];
 
@@ -149,9 +145,6 @@ export async function buildLegalStance(
     const xrefRows = db.prepare(xrefSql).all(...allDocIds, ...allDocIds) as CrossReferenceSummary[];
     crossReferences.push(...xrefRows);
   }
-
-  // Suppress unused variable warning — provisionDocRefs is used for future extension
-  void provisionDocRefs;
 
   const result: BuildLegalStanceResult = {
     query,

@@ -1,4 +1,5 @@
 import type { Database } from '@ansvar/mcp-sqlite';
+import axios from 'axios';
 import { buildFtsQueryVariants } from '../utils/fts-query.js';
 import { normalizeAsOfDate } from '../utils/as-of-date.js';
 import { resolveDocumentId } from '../utils/document-id.js';
@@ -12,6 +13,7 @@ import {
 
 export interface SearchLegislationInput {
   query: string;
+  original_query?: string;
   document_id?: string;
   status?: string;
   as_of_date?: string;
@@ -235,6 +237,89 @@ function addResultCitations(rows: SearchLegislationResult[]): SearchLegislationR
   });
 }
 
+// ---------------------------------------------------------------------------
+// STAGE 0 — Haiku generates targeted legal search terms for FTS
+// ---------------------------------------------------------------------------
+
+const HAIKU_TERMS_SYSTEM_PROMPT = `Jij bent een juridisch zoeksysteem voor de Nederlandse wetgevingsdatabase (SQLite FTS).
+
+TAAK:
+Analyseer de juridische vraag en geef 3 tot 5 specifieke juridische termen of korte zinsdelen die letterlijk in Nederlandse wetsartikelen voorkomen en het meest relevant zijn voor deze vraag.
+
+REGELS:
+- Geef alleen termen die in wetteksten voorkomen (niet in omgangstaal)
+- Één term per regel
+- Geen uitleg, geen nummers, geen bullets
+- Maximaal 5 termen
+
+VOORBEELDEN:
+
+Input: "Ik heb een werknemer die regelmatig te laat komt en slecht presteert, kan ik hem ontslaan?"
+Output:
+disfunctioneren
+ontbinding arbeidsovereenkomst
+verbetertraject
+herplaatsing
+
+Input: "Klant betaalt niet, kan ik rente en incassokosten in rekening brengen?"
+Output:
+verzuim
+wettelijke rente
+buitengerechtelijke incassokosten
+handelsovereenkomst
+
+Input: "Gekocht product werkt niet, wat zijn mijn rechten?"
+Output:
+non-conformiteit
+aflevering
+herstel vervanging
+ontbinding koopovereenkomst
+
+Input: "Mijn werknemer is ziek, hoelang moet ik loon doorbetalen?"
+Output:
+loondoorbetaling ziekte
+arbeidsongeschiktheid
+re-integratie
+passende arbeid`;
+
+async function buildFtsTermsWithHaiku(query: string): Promise<string[]> {
+  const model = process.env.ANTHROPIC_TITLE_MODEL;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!model || !apiKey) return [];
+
+  try {
+    const response = await axios.post<{ content: Array<{ text: string }> }>(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model,
+        max_tokens: 120,
+        temperature: 0,
+        system: HAIKU_TERMS_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: query }],
+      },
+      {
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        timeout: 6000,
+      },
+    );
+
+    const text = response.data?.content?.[0]?.text?.trim() ?? '';
+    const terms = text
+      .split(/\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 2 && l.length < 60);
+    console.error(`[haiku-terms] "${query.slice(0, 60)}" → ${terms.join(' | ') || 'none'}`);
+    return terms;
+  } catch (err) {
+    console.error(`[haiku-terms] failed (${String(err)})`);
+    return [];
+  }
+}
+
 export async function searchLegislation(
   db: Database,
   input: SearchLegislationInput,
@@ -284,21 +369,47 @@ export async function searchLegislation(
     ? (q: string) => runVersionedFtsSearch(db, q, asOfDate, resolvedDocId, status, fetchLimit)
     : (q: string) => runFtsSearch(db, q, resolvedDocId, status, fetchLimit);
 
-  let results = await withSqliteLockRetry(() => search(primaryQuery));
-  let broadened = false;
+  // Run Haiku term generation and primary FTS in parallel
+  const haikuInput = input.original_query?.trim() || query;
+  const [haikuTerms, primaryResults] = await Promise.all([
+    buildFtsTermsWithHaiku(haikuInput),
+    withSqliteLockRetry(() => search(primaryQuery)),
+  ]);
 
-  if (results.length === 0 && fallbackQuery) {
-    results = await withSqliteLockRetry(() => search(fallbackQuery));
-    broadened = results.length > 0;
+  // Run FTS for each Haiku term (sequential to avoid DB lock contention)
+  const haikuResults: SearchLegislationResult[] = [];
+  for (const term of haikuTerms) {
+    const rows = await withSqliteLockRetry(() => search(term));
+    haikuResults.push(...rows);
   }
 
-  const deduped = addResultCitations(deduplicateResults(results, limit));
+  let broadened = false;
+  let ftsBase = primaryResults;
+  if (ftsBase.length === 0 && fallbackQuery) {
+    ftsBase = await withSqliteLockRetry(() => search(fallbackQuery));
+    broadened = ftsBase.length > 0;
+  }
+
+  // Merge: Haiku-guided FTS hits first (more targeted), primary FTS fills remaining slots
+  const seenKeys = new Set<string>();
+  const merged: SearchLegislationResult[] = [];
+
+  for (const row of [...haikuResults, ...ftsBase]) {
+    const key = `${row.document_id}::${row.provision_ref}`;
+    if (!seenKeys.has(key)) {
+      seenKeys.add(key);
+      merged.push(row);
+    }
+  }
+
+  const deduped = addResultCitations(deduplicateResults(merged, limit));
 
   return {
     results: deduped,
     _metadata: {
       ...generateResponseMetadata(db),
       ...(broadened ? { query_strategy: 'broadened' } : {}),
+      ...(haikuTerms.length > 0 ? { haiku_terms: haikuTerms.length } : {}),
     },
   };
 }
